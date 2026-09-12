@@ -134,27 +134,41 @@ gpu:
 ops:
   - op_id: text_classification
     version: v1
-    min_gpu_mem_mb: 4096
+    min_per_device_mb: 4096        # 单卡至少 4GB(BERT-base 占用)
     require_compute_cap: ">=7.5"
+    require_min_gpus: 1
+    tensor_parallel_degree: 0      # 0 = 无 TP,单卡跑
 ```
 
 **未来扩展(LLM 大模型场景)**:
 
 ```yaml
-# 1:N 模式 — 单 Worker 管 4 卡跑 TP-4
+# 1:N 模式 — 单 Worker 管 4 卡跑 TP-4 (Qwen-72B / vLLM)
 gpu:
-  managed_devices:
-    - gpu_id: "gpu-0"
-    - gpu_id: "gpu-1"
-    - gpu_id: "gpu-2"
-    - gpu_id: "gpu-3"
+  managed_devices:                  # 紧凑写法(详细见 §12.6.5)
+    - gpu-0
+    - gpu-1
+    - gpu-2
+    - gpu-3
   topology_hint: "nvlink-domain"
 ops:
   - op_id: llm_qwen70b
     version: v1
-    min_gpu_mem_mb: 80000     # 跨 4 卡共 80GB+
-    require_min_gpus: 4
+    min_per_device_mb: 45000        # 单卡至少 45GB(权重 35GB + KV cache 弹性)
+    min_total_mem_mb: 180000        # 4 卡合计至少 180GB
+    require_compute_cap: ">=9.0"    # 必须 H100/A100 算力
+    require_min_gpus: 4             # 至少 4 卡
+    tensor_parallel_degree: 4       # 强制 TP-4
 ```
+
+**字段语义澄清**(对齐 §12.6.1 Protobuf):
+
+| 字段 | 含义 | 校验逻辑 |
+|---|---|---|
+| `min_per_device_mb` | 单卡最低显存 | ∀ device ∈ managed_devices: `device.mem_total_mb ≥ min_per_device_mb` |
+| `min_total_mem_mb` | 所有 managed_devices 显存总和 | Σ `device.mem_total_mb ≥ min_total_mem_mb` |
+| `require_min_gpus` | TP 跨卡场景下最少卡数 | `len(managed_devices) ≥ require_min_gpus` |
+| `tensor_parallel_degree` | TP 度(0=无 TP 单卡) | `tensor_parallel_degree == len(managed_devices)`(严格相等,不允许 "4 卡跑 TP-2") |
 
 详细 Protobuf 字段定义与注册流程见 [§12.6](#126-worker-启动配置协议v21-新增)。
 
@@ -1204,11 +1218,13 @@ message ManagedGpuDevice {
 }
 
 message OpCapability {
-  string op_id              = 1;
-  string version            = 2;
-  int64  min_gpu_mem_mb     = 3;
-  string require_compute_cap = 4;     // 表达式,如 ">=7.5"
-  int32  require_min_gpus   = 5;     // 跨卡 TP 场景
+  string op_id                    = 1;
+  string version                  = 2;
+  int64  min_per_device_mb        = 3;   // 单卡最低显存(过滤算力不够的卡)
+  int64  min_total_mem_mb         = 4;   // 所有 managed_devices 显存总和下限(0 = 不约束)
+  string require_compute_cap      = 5;   // 表达式,如 ">=7.5" 或 ">=9.0"
+  int32  require_min_gpus         = 6;   // TP 跨卡场景下最少卡数(默认 1)
+  int32  tensor_parallel_degree   = 7;   // TP 度(0 = 无 TP,单卡跑;>0 时必须 == len(managed_devices))
 }
 
 message WorkerConfig {
@@ -1240,17 +1256,35 @@ Worker 启动
 #### 12.6.3 Scheduler 端基于 WorkerConfig 的调度过滤
 
 ```java
-// 伪代码:接 §12.5 算法流程,在过滤阶段增加 supported_ops 检查
+// 伪代码:接 §12.5 算法流程,在过滤阶段增加 supported_ops 检查 + TP 度匹配
 public WorkerNode selectWorker(SubmitTaskRequest req) {
   return workers.values().stream()
     .filter(w -> w.health == HEALTHY)
     .filter(w -> w.config.supported_ops.stream()
-        .anyMatch(op -> op.op_id.equals(req.opId)
-                      && op.version.equals(req.opVersion)
-                      && w.totalMemMb() >= op.min_gpu_mem_mb
-                      && w.managedDeviceCount() >= op.require_min_gpus))
+        .anyMatch(op -> isOpCompatible(w, req, op)))
     .min(Comparator.comparingDouble(this::score))   // §12.5 多维度打分
     .orElse(null);
+}
+
+// 单个 Op 与 Worker 的兼容性校验(对应 §12.6.1 字段语义)
+private boolean isOpCompatible(WorkerNode w, SubmitTaskRequest req, OpCapability op) {
+  // 1. 基本匹配
+  if (!op.op_id.equals(req.opId)) return false;
+  if (!op.version.equals(req.opVersion)) return false;
+  // 2. TP 度严格匹配(0=无 TP,>0 必须等于 Worker 实际管理的卡数)
+  int tpDegree = op.tensor_parallel_degree;
+  if (tpDegree > 0 && tpDegree != w.managedDeviceCount()) return false;
+  // 3. 卡数下限
+  if (w.managedDeviceCount() < op.require_min_gpus) return false;
+  // 4. 总量显存校验(Σ 所有 managed_devices)
+  long totalMemMb = w.config.managed_devices.stream()
+                       .mapToLong(d -> d.mem_total_mb).sum();
+  if (op.min_total_mem_mb > 0 && totalMemMb < op.min_total_mem_mb) return false;
+  // 5. 单卡显存校验(∀ device)
+  boolean perDeviceOk = w.config.managed_devices.stream()
+      .allMatch(d -> d.mem_total_mb >= op.min_per_device_mb
+                  && computeCapMatch(d.compute_cap, op.require_compute_cap));
+  return perDeviceOk;
 }
 ```
 
@@ -1261,6 +1295,56 @@ public WorkerNode selectWorker(SubmitTaskRequest req) {
 | MVP (V2.1) | **1:1** | ≤ 3 节点,1 个轻量推理 Op(text_classification) |
 | V2.5 | 1:1 + 1:7(MIG) | 多业务隔离,H100 MIG 实例化 |
 | V3.0 | **1:N 灵活** | LLM 70B+ 跨卡 TP,WorkerConfig 自由声明 managed_devices |
+
+#### 12.6.5 ⚠️ managed_devices 写法契约与错误处理(V2.1 新增)
+
+`managed_devices` 字段接受两种 YAML 写法,解析器内部归一化为统一结构。
+
+**写法 A — 紧凑形式**(LLM 大模型场景首选,4-8 卡快速配置):
+
+```yaml
+gpu:
+  managed_devices: [gpu-0, gpu-1, gpu-2, gpu-3]
+```
+
+→ 解析器行为:遍历每个字符串,调 `nvidia-smi`/`nvml` 查询真实 `mem_total_mb` 与 `compute_cap`,`isolation` 默认 `soft`。所有字段自动补全。
+
+**写法 B — 详细形式**(需要混合隔离、单卡调参场景):
+
+```yaml
+gpu:
+  managed_devices:
+    - gpu_id: "gpu-0"
+      isolation: "soft"
+      mem_total_mb: 81920
+      compute_cap: "9.0"
+      nvlink_peers: [gpu-1, gpu-2, gpu-3]
+    - gpu_id: "gpu-1"
+      isolation: "mps"            # 同一 Worker 内允许不同 isolation(但同卡只能一种)
+      ...
+```
+
+→ 解析器行为:直接采用用户值,**不**调用 `nvidia-smi` 覆盖(避免"配置写错被静默纠正")。
+
+**混用形式**:`["gpu-0", {gpu_id: "gpu-1", isolation: "mps"}, ...]` ❌ **启动期直接报错**,避免隐式继承歧义。
+
+**配套错误处理策略**(MVP 严格模式):
+
+| 错误场景 | 行为 | 错误码/日志 |
+|---|---|---|
+| 紧凑形式指定了 `nvidia-smi` 不可见的 GPU ID | 启动失败 | `ConfigException: gpu-99 不存在;实际可见: gpu-0, gpu-1, gpu-2, gpu-3` |
+| 详细形式 `mem_total_mb` 与 `nvidia-smi` 不一致 | 启动失败(严格模式) | `ConfigException: gpu-0 配置 mem_total_mb=99999 与实际 81920 不符` |
+| `compute_cap` 不满足 Op `require_compute_cap` | Op 不注册到 Scheduler(其他 Op 不受影响) | `WARN: op text_classification:v1 因 compute_cap 8.0 < required >=9.0 未注册` |
+| `tensor_parallel_degree > 0` 但 `≠ len(managed_devices)` | Op 不注册 | `ConfigException: tensor_parallel_degree=4 必须等于 managed_devices 实际卡数 2` |
+| `require_min_gpus > len(managed_devices)` | Op 不注册 | `ConfigException: require_min_gpus=4 超过 managed_devices 实际卡数 2` |
+| 紧凑/详细混用 | 启动失败 | `ConfigException: managed_devices 元素必须全 String 或全 Map` |
+| 详细形式任一 device 缺 `gpu_id` 字段 | 启动失败 | `ConfigException: managed_devices[1] 缺少 gpu_id 字段` |
+| `topology_hint` 值不在白名单(nvlink-domain / pcie-single / cross-node) | 启动失败 | `ConfigException: topology_hint='unknown' 不在白名单` |
+
+**宽松模式**(可选,通过 `gpu.config_strict_mode: false` 开启):
+- 详细形式 `mem_total_mb` 与 nvidia-smi 不一致 → 以 nvidia-smi 为准,记 WARN 日志(用于"先写大值防升级时卡升级到更大显存")
+
+**MVP 默认严格模式**,防止"配置写错被静默覆盖"导致线上行为不符合预期。
 
 ---
 
