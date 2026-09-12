@@ -161,6 +161,54 @@ ops:
     tensor_parallel_degree: 4       # 强制 TP-4
 ```
 
+**多 Op 混合加载**(单 Worker 同时跑 2 个轻量 Op,节省 GPU):
+
+```yaml
+# 1:1 模式 — 1 张 24GB 卡,同时加载 2 个轻量推理 Op
+# 场景:文本分类 + 语义 embedding 共存(总占用 ~6GB,显存利用率 25%)
+gpu:
+  managed_devices:
+    - gpu_id: "gpu-0"
+      isolation: "soft"
+      mem_total_mb: 24576           # RTX 4090 / A10 24GB
+      compute_cap: "8.9"
+ops:
+  # Op 1:文本分类(BERT-base,~4GB 显存)
+  - op_id: text_classification
+    version: v1
+    model_path: /models/bert-base-chinese
+    handler_class: com.xx.cloud.gpu.ops.TextClassificationOp
+    min_per_device_mb: 4096
+    require_compute_cap: ">=7.5"
+    require_min_gpus: 1
+    tensor_parallel_degree: 0
+
+  # Op 2:语义 embedding(BGE-small,~2GB 显存)
+  - op_id: text_embedding
+    version: v2
+    model_path: /models/bge-small-zh-v1.5
+    handler_class: com.xx.cloud.gpu.ops.TextEmbeddingOp
+    min_per_device_mb: 2048
+    require_compute_cap: ">=7.5"
+    require_min_gpus: 1
+    tensor_parallel_degree: 0
+
+  # Op 3:故意不兼容,启动期算力校验会被剔除(参考 §12.6.5 错误处理)
+  # - op_id: llm_qwen70b
+  #   ...
+  #   require_compute_cap: ">=9.0"   # 当前卡 8.9 < 9.0,启动 WARN:该 Op 不注册,其他 Op 不受影响
+```
+
+**多 Op 加载的运行时行为**:
+
+| 维度 | 行为 |
+|---|---|
+| **启动期** | Worker 启动 → 解析 ops 列表 → 对每个 Op 跑一遍 `OpRegistry.load()` → 全部成功才上报 WorkerConfig;任一 Op 加载失败 → **整个 Worker 不注册**(避免半残状态) |
+| **模型占用** | 所有 Op 模型权重常驻显存,**不**按需 swap;Scheduler 在 `gpu_worker_status.running_task_ids` 层面追踪每个 task 用的是哪个 Op,**不**追踪 GPU 显存分摊(MVP 简化) |
+| **显存保护** | 加载 N 个 Op 后,Scheduler 把 `mem_used_mb = Σ op.estimated_peak_mem_mb`,超过 device 总显存 → Op 加载失败,启动直接报错 |
+| **调度可见性** | Scheduler 看到的 `supported_ops` 是列表:`[{op_id: text_classification, version: v1}, {op_id: text_embedding, version: v2}]`,任务来了按 op_id+version 匹配 |
+| **热卸载** | MVP 不支持;V2.5 可加 `op_id.enable: bool` 配置 + 运行时 `POST /admin/worker/{id}/ops/{op_id}:reload` 接口 |
+
 **字段语义澄清**(对齐 §12.6.1 Protobuf):
 
 | 字段 | 含义 | 校验逻辑 |
