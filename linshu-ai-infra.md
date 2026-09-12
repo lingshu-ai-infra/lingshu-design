@@ -134,6 +134,9 @@ gpu:
 ops:
   - op_id: text_classification
     version: v1
+    handler:
+      runtime: PYTHON_JEP          # MVP 默认:Python 通过 Jep 嵌在 JVM 内
+      class:   lingshu_ops.classification.TextClassificationOp
     min_per_device_mb: 4096        # 单卡至少 4GB(BERT-base 占用)
     require_compute_cap: ">=7.5"
     require_min_gpus: 1
@@ -154,6 +157,13 @@ gpu:
 ops:
   - op_id: llm_qwen70b
     version: v1
+    handler:
+      runtime: PYTHON_SIDECAR      # 生产推荐:独立 Python 进程,gRPC(见 §12.6.7)
+      class:   lingshu_ops.qwen70b.Qwen70BOp
+      sidecar:
+        endpoint:    "unix:///tmp/lingshu-qwen70b.sock"
+        startup_cmd: "python -m lingshu_ops.qwen70b --port 50051"
+        timeout_ms:  30000
     min_per_device_mb: 45000        # 单卡至少 45GB(权重 35GB + KV cache 弹性)
     min_total_mem_mb: 180000        # 4 卡合计至少 180GB
     require_compute_cap: ">=9.0"    # 必须 H100/A100 算力
@@ -173,30 +183,42 @@ gpu:
       mem_total_mb: 24576           # RTX 4090 / A10 24GB
       compute_cap: "8.9"
 ops:
-  # Op 1:文本分类(BERT-base,~4GB 显存)
+  # Op 1:文本分类(BERT-base,~4GB 显存,MVP 默认 Jep 桥)
   - op_id: text_classification
     version: v1
     model_path: /models/bert-base-chinese
-    handler_class: com.xx.cloud.gpu.ops.TextClassificationOp
+    handler:
+      runtime: PYTHON_JEP
+      class:   lingshu_ops.classification.TextClassificationOp
     min_per_device_mb: 4096
     require_compute_cap: ">=7.5"
     require_min_gpus: 1
     tensor_parallel_degree: 0
 
-  # Op 2:语义 embedding(BGE-small,~2GB 显存)
+  # Op 2:语义 embedding(BGE-small,~2GB 显存,MVP 默认 Jep 桥)
   - op_id: text_embedding
     version: v2
     model_path: /models/bge-small-zh-v1.5
-    handler_class: com.xx.cloud.gpu.ops.TextEmbeddingOp
+    handler:
+      runtime: PYTHON_JEP
+      class:   lingshu_ops.embedding.TextEmbeddingOp
     min_per_device_mb: 2048
     require_compute_cap: ">=7.5"
     require_min_gpus: 1
     tensor_parallel_degree: 0
 
-  # Op 3:故意不兼容,启动期算力校验会被剔除(参考 §12.6.5 错误处理)
+  # Op 3:故意算力不兼容,启动期 §12.6.5 严格模式会剔除该 Op
   # - op_id: llm_qwen70b
-  #   ...
-  #   require_compute_cap: ">=9.0"   # 当前卡 8.9 < 9.0,启动 WARN:该 Op 不注册,其他 Op 不受影响
+  #   version: v1
+  #   model_path: /models/qwen2.5-72b
+  #   handler:
+  #     runtime: PYTHON_SIDECAR  # 大模型生产推荐(见 §12.6.6 / §12.6.7)
+  #     class:   lingshu_ops.qwen70b.Qwen70BOp
+  #     sidecar:
+  #       endpoint:    "unix:///tmp/lingshu-qwen70b.sock"
+  #       startup_cmd: "python -m lingshu_ops.qwen70b --port 50051"
+  #       timeout_ms:  30000
+  #   require_compute_cap: ">=9.0"   # 卡 8.9 < 9.0 → 启动 WARN:该 Op 不注册,其他 Op 不受影响
 ```
 
 **多 Op 加载的运行时行为**:
@@ -1265,6 +1287,30 @@ message ManagedGpuDevice {
   repeated string nvlink_peers = 5;  // 同 NVLink 域的 peer gpu_id 列表
 }
 
+// Op 的执行体 — 描述 Op 在 Worker 进程内 / 外怎么跑
+// 设计动机:算子大多数是 Python(PyTorch / vLLM / TensorRT),少数高性能 Op 用 Java/Rust 写;
+// 区分 runtime 让 Worker 启动器知道是加载 class、调 Jep 子解释器,还是拉起 Sidecar 进程
+message OpHandlerSpec {
+  enum Runtime {
+    RUNTIME_UNSPECIFIED = 0;
+    JAVA               = 1;   // 纯 Java/C++ Op,Worker 类路径直接加载
+    PYTHON_JEP         = 2;   // Python 通过 Jep 嵌入 JVM(同 JVM 内存调用,无 IPC,MVP 简单方案)
+    PYTHON_SIDECAR     = 3;   // Python 独立进程,通过 gRPC/UDS 与 Worker 通信(生产推荐,崩溃隔离)
+    RUST               = 4;   // Rust 动态库,通过 JNI 加载(预留,V3.0 探索)
+  }
+  Runtime runtime                 = 1;
+  string class                    = 2;   // 全限定类名 / Python 模块路径 / Rust crate 名
+  SidecarConfig sidecar           = 3;   // 仅 PYTHON_SIDECAR 必填,其他 runtime 忽略
+}
+
+// PYTHON_SIDECAR 模式专属:Sidecar 进程拉起 + 通信参数
+message SidecarConfig {
+  string endpoint    = 1;   // 通信端点:"unix:///tmp/lingshu-qwen70b.sock" 或 "tcp://127.0.0.1:50051"
+  string startup_cmd = 2;   // Worker 拉起 Sidecar 的命令(如 "python -m lingshu_ops.qwen70b --port 50051")
+  int32  timeout_ms  = 3;   // 单次 RPC 超时(MVP 默认 30000,LLM 大模型可调到 120000)
+  string working_dir = 4;   // Sidecar 工作目录(默认 = Worker cwd)
+}
+
 message OpCapability {
   string op_id                    = 1;
   string version                  = 2;
@@ -1273,6 +1319,7 @@ message OpCapability {
   string require_compute_cap      = 5;   // 表达式,如 ">=7.5" 或 ">=9.0"
   int32  require_min_gpus         = 6;   // TP 跨卡场景下最少卡数(默认 1)
   int32  tensor_parallel_degree   = 7;   // TP 度(0 = 无 TP,单卡跑;>0 时必须 == len(managed_devices))
+  OpHandlerSpec handler           = 8;   // Op 执行体声明(取代原 handler_class 字符串)
 }
 
 message WorkerConfig {
@@ -1393,6 +1440,116 @@ gpu:
 - 详细形式 `mem_total_mb` 与 nvidia-smi 不一致 → 以 nvidia-smi 为准,记 WARN 日志(用于"先写大值防升级时卡升级到更大显存")
 
 **MVP 默认严格模式**,防止"配置写错被静默覆盖"导致线上行为不符合预期。
+
+#### 12.6.6 ⚠️ Op Handler Runtime 模式选型指南(V2.1 新增)
+
+算子选什么 `runtime`,本质是问"Op 的执行体跑在哪个进程空间里、与 Worker 主进程是什么关系"。四种 runtime 的取舍:
+
+| Runtime | 进程模型 | 调用开销 | 崩溃隔离 | 适用场景 | MVP 推荐度 |
+|---|---|---|---|---|---|
+| **JAVA** | Worker JVM 内,直接 `Class.forName().newInstance()` | 纳秒级(JIT 后) | ❌ 与 Worker 同生共死 | 纯 Java 实现的轻量预处理(字符串清洗、特征抽取)、CUDA C++ via JNI 的自定义算子 | ★★ 仅限 Java/C++ 团队维护的 Op |
+| **PYTHON_JEP** | Worker JVM 内,通过 Jep 调 Python 子解释器 | 微秒级(同进程 GIL) | ❌ Python panic 会拖垮 JVM | MVP 首选;中小模型推理(<10B)、模型用 PyTorch 但团队不想维护 Sidecar | ★★★★★ MVP 默认 |
+| **PYTHON_SIDECAR** | 独立 Python 进程,gRPC/UDS 通信 | 毫秒级(IPC) | ✅ Sidecar 崩溃只影响该 Op,Worker 仍存活并可降级到其他 Op | LLM 70B+ 大模型(常驻显存、多卡 TP)、第三方 Python 包版本冲突严重、需要崩溃隔离的生产 Op | ★★★★★ 生产默认 |
+| **RUST** | Worker JVM 内,通过 JNI 调 Rust 动态库 | 纳秒级 | ❌ 段错误会拖垮 JVM(预留 V3.0 探索) | 高性能定制算子(如自定义 attention kernel)、需要极致 CPU 侧性能 | ☆ V3.0 探索 |
+
+**决策树**:
+
+```
+Op 是怎么写的?
+├─ 纯 Java/C++ ──→ JAVA
+├─ Python(中小模型,<10B,单卡即可)
+│   ├─ 团队熟悉 Jep,运维成本敏感 ──→ PYTHON_JEP(MVP 默认)
+│   └─ 需要崩溃隔离 / Python 包管理独立 ──→ PYTHON_SIDECAR
+├─ Python(LLM 70B+,TP 跨卡,常驻显存) ──→ PYTHON_SIDECAR(必须)
+└─ Rust(自定义高性能算子) ──→ RUST(V3.0+)
+```
+
+**YAML 三种写法对照**:
+
+```yaml
+# 写法 1:JAVA — 纯 Java Op
+handler:
+  runtime: JAVA
+  class:   com.lingshu.gpuops.preprocess.TextNormalizeOp
+  # 无 sidecar 字段
+
+# 写法 2:PYTHON_JEP — MVP 默认,MVP 阶段不引入 gRPC 复杂度
+handler:
+  runtime: PYTHON_JEP
+  class:   lingshu_ops.classification.TextClassificationOp
+  # 无 sidecar 字段
+
+# 写法 3:PYTHON_SIDECAR — 生产推荐,大模型 / 强隔离
+handler:
+  runtime: PYTHON_SIDECAR
+  class:   lingshu_ops.qwen70b.Qwen70BOp
+  sidecar:
+    endpoint:    "unix:///tmp/lingshu-qwen70b.sock"   # 同机用 UDS,跨机用 TCP
+    startup_cmd: "python -m lingshu_ops.qwen70b --port 50051"
+    timeout_ms:  30000
+    working_dir: "/opt/lingshu/sidecars"
+```
+
+**演进节奏**:
+- **V2.1 MVP**: 只实现 `JAVA` 和 `PYTHON_JEP`(代码量小,运维简单);`PYTHON_SIDECAR` 留协议位,不实现
+- **V2.5**: 实现 `PYTHON_SIDECAR`(LLM 70B+ 场景解锁),Worker 启动器加 Sidecar 子进程管理
+- **V3.0**: 探索 `RUST`(PyO3 / JNI 双绑),给极致性能 Op 留口子
+
+#### 12.6.7 ⚠️ Python Sidecar 生命周期管理(V2.5 规划)
+
+> **MVP 不实现**;`PYTHON_SIDECAR` runtime 在 V2.5 引入,本节为协议预留 + 后续实现指引。
+
+**为什么需要 Sidecar**:Python 与 JVM 同进程时,一旦 Python 解释器 panic(CUDA OOM、段错误、第三方包未捕获异常),整个 Worker JVM 可能跟着挂掉。Sidecar 把 Op 隔离到独立 Python 进程,崩溃只丢一个 Op,Worker 主进程可以摘掉该 Op 后上报"不健康 + 标记 Op 不可用"。
+
+**架构图**:
+
+```
+┌──────────────────────────────── Worker JVM 进程 ────────────────────────────────┐
+│                                                                                  │
+│  OpDispatcher                                                                   │
+│    ├─ JavaOp(text_normalize) ──── 直接 invoke ────────────────────► 返回         │
+│    ├─ JepOp(text_classification) ─ Jep.eval() ──────────────────► 返回         │
+│    └─ SidecarOpProxy(llm_qwen70b) ─────┐                                        │
+│                                        │ gRPC over UDS(/tmp/lingshu-qwen70b.sock)│
+└────────────────────────────────────────┼─────────────────────────────────────────┘
+                                         │
+                                         ▼
+              ┌── Sidecar 进程 #1 (python -m lingshu_ops.qwen70b) ──┐
+              │  - 独立 GIL,独立 CUDA context                       │
+              │  - 心跳上报到 Worker(每 5s)                         │
+              │  - 收到 SIGTERM 优雅退出(卸载模型 + flush KV cache)│
+              └────────────────────────────────────────────────────┘
+```
+
+**生命周期 6 个阶段**:
+
+| 阶段 | 触发条件 | Worker 行为 | Sidecar 行为 | 失败处理 |
+|---|---|---|---|---|
+| **1. 启动顺序** | Worker `OpRegistry.load()` | 先按拓扑序启动所有 `PYTHON_SIDECAR` Op 的 Sidecar(`startup_cmd`),等 `/healthz` 返回 200 才继续 | Python 进程 fork,加载模型,listen UDS | Sidecar 30s 内未就绪 → Worker 启动失败,记 `ConfigException: sidecar llm_qwen70b 启动超时 30000ms` |
+| **2. 健康检查** | 持续(每 5s) | gRPC health check ping | 返回 `SERVING` + 显存占用 | 连续 3 次失败 → 标记 Op 不可用,Scheduler 收到 `supported_ops` 更新(去掉该 Op) |
+| **3. 正常调用** | 任务派发 | gRPC `InferenceRequest` | 执行推理,流式返回 `InferenceResponse` | RPC 超时(`timeout_ms`)→ Worker 记录 `OpTimeoutException`,任务失败,不杀 Sidecar |
+| **4. 崩溃恢复** | Sidecar 进程 exit code ≠ 0 | 检测到进程死亡 → 标记 Op 不健康 → 触发重启(指数退避:1s/2s/4s/8s,上限 30s) | n/a | 5 分钟内重启失败 ≥ 3 次 → 标记 Op 永久不可用,Worker 上报"半健康",运维介入 |
+| **5. 优雅停止** | Worker 收到 SIGTERM / 配置 reload | 先 RPC `ShutdownRequest` 给所有 Sidecar → 收到 `ShutdownResponse` 后 `kill -TERM` | 卸载模型、flush KV cache、关闭 UDS listener、exit 0 | Sidecar 10s 内未退出 → `kill -9` 强杀,记 WARN |
+| **6. 资源清理** | Worker 关闭 / Op 重载 | 删除 UDS socket 文件(`/tmp/lingshu-qwen70b.sock`) | 释放 CUDA context、显存 | UDS 文件残留 → 启动时检测到残留 → 自动 unlink 后重新 bind |
+
+**关键设计决策**:
+
+1. **Socket 文件管理**:UDS socket 文件(如 `/tmp/lingshu-qwen70b.sock`)由 Worker 创建,Sidecar 只 `bind()` 不创建;Worker 关闭时负责清理,防止"重启 Worker 报 `Address already in use`"。
+2. **资源隔离**:每个 Sidecar Op 用独立 `CUDA_VISIBLE_DEVICES`(从 `managed_devices` 分配)+ 独立 Python 进程;Sidecar 间互不感知,共享物理卡时显存总和受 Worker 总配额约束。
+3. **不重启 Sidecar 做模型热更新**:模型版本变更需要重启 Sidecar(因为模型常驻显存);V3.0 可加 Sidecar 内 `ReloadModelRequest`,但 MVP/V2.5 简化处理。
+4. **心跳独立于 Worker 心跳**:Sidecar → Worker 的心跳走 UDS(本地),Worker → Scheduler 的心跳走 TCP;两者解耦,Sidecar 死亡不会立即让 Worker 不健康(Worker 还能跑其他 JAVA/Jep Op)。
+5. **Sidecar 进程数 ≠ Worker 数**:1 个 Worker 可以拉起多个 Sidecar 进程(每个 `PYTHON_SIDECAR` Op 一个);Sidecar 死亡不杀 Worker,Worker 死亡 → `kill -9` 所有 Sidecar 子进程(Worker 是 init,内核保证进程组清理)。
+
+**与 §12.5 调度算法的关系**:
+- Scheduler 的 `selectWorker()` 不感知 runtime 细节,只看 `supported_ops` 是否包含所需 `op_id+version`
+- Sidecar 健康状态由 Worker 异步上报,Scheduler 看到的 `supported_ops` 是"实时剔除不健康 Op"后的列表
+- 重启 Sidecar 时,Scheduler 收到 `supported_ops` 临时剔除该 Op,任务会派给其他 Worker;重启成功后再次上报,调度恢复
+
+**V2.5 落地路径**:
+1. Worker 启动器实现 `SidecarProcessManager`(基于 `ProcessBuilder`),封装 6 个阶段
+2. Sidecar SDK 提供 Python 模板:`lingshu_ops.sidecar.OpSidecarBase`(封装 gRPC server + healthz + 优雅关闭)
+3. 监控指标:`sidecar_restart_total{op_id}`、`sidecar_startup_latency_ms{op_id}`、`sidecar_health_fail_streak{op_id}`
+4. 文档:在 `lingshu-gpu-worker` repo 的 `examples/sidecar-op/` 提供 `qwen70b` 完整 demo
 
 ---
 
