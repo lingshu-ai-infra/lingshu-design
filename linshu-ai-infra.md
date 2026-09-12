@@ -1787,3 +1787,20 @@ handler:
 **冻结时间**:V2.1 基线已冻结,进入 MVP 开发阶段。
 
 **变更管理**:后续如需调整任一决策,需走 RFC 流程重新评审。
+
+---
+
+## 14. 引用指引(配套文档)
+
+> 本节是配套文档的导航索引,所有仓库级细节不在此处展开。
+
+| 文档 | 路径 | 用途 |
+|---|---|---|
+| **主设计文档** | `linshu-ai-infra.md`(本文件) | 架构定义、协议规范、决策记录(§1-§13)|
+| **MVP 分解** | `mvp-stories.md` | 14 个 Story + AC + 验收标准 |
+| **仓库结构** | `repo-structure.md` | 16 个 repo 内部目录 + 跨仓依赖图 + Release 策略 |
+| **RFC / ADR** | `rfc/` 与 `decisions/` | 重大决策原文与依据(草稿中,V3.0 沉淀)|
+
+每个 repo 的 README 顶部应引用 `repo-structure.md`:
+
+> 本仓库结构定义见 [lingshu-design/repo-structure.md](https://github.com/lingshu-ai-infra/lingshu-design/blob/main/repo-structure.md)
