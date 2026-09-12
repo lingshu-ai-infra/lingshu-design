@@ -1553,6 +1553,219 @@ handler:
 
 ---
 
+## 12.7 ⚠️ 水平扩展与 Federation(V3.0+ 规划)
+
+> 本章基于"集群规模化挑战"推导。V2.1 MVP 暂不实施,但需要预留协议位;**§12.7.2 状态分层(热/冷)是 V2.5 关键修复项**,先于 Federation 落地。
+
+### 12.7.1 集群规模基线与四档定位
+
+单集群规模上限由**单 Scheduler 副本**的最弱层决定:
+
+| 层 | 瓶颈指标 | 单副本天花板 | 卡死信号 |
+|---|---|---|---|
+| **Scheduler CPU** | `selectWorker()` O(W × O_ops) 线性扫描 + §12.5 多维度打分 | **~3,000–5,000 Worker / 副本** | GC 停顿 > 1s、调度延迟 P99 涨到 500ms |
+| **MySQL 写** | 心跳 `UPDATE gpu_worker_status` × W / 5s | **~5,000–10,000 Worker**(InnoDB row-lock) | `last_heartbeat` 行锁竞争、`UPDATE P99 > 200ms` |
+| **Gateway → Scheduler RPC fan-in** | 每次 `SubmitTaskRequest` 调 `selectWorker()` | **~10,000 QPS 任务派发 / 副本** | RPC 队列堆积、Gateway 502 |
+| **心跳包速率** | 5s 间隔 × W × ~500B | **~20,000 Worker** 才到带宽瓶颈(2 MB/s) | 带宽充裕,不是瓶颈 |
+| **Worker ↔ GPU 数** | 由 `WorkerConfig.managed_devices` 自由声明 | **Worker × 平均卡数** | 受 Scheduler 单副本天花板约束 |
+
+**集群四档定位**:
+
+| 档位 | GPU 规模 | Worker 数(1:1 默认) | 架构 |
+|---|---|---|---|
+| 小 | ≤ 30 GPU | 30 | 单 Scheduler + 单 MySQL,MVP 即覆盖 |
+| 中 | 30–300 GPU | 300 | 单 Scheduler + MySQL 读写分离 |
+| 大 | 300–3,000 GPU | 3,000 | 单 Scheduler(优化后)+ MySQL 水平拆分 |
+| 超大 | > 3,000 GPU | > 3,000 | 必须 Scheduler 多副本 + op_id 分片,心跳走 Redis |
+
+**网络并发/吞吐测算**:
+
+| 流量类型 | 单 Worker 5s 心跳 | 控制面总带宽 | 数据面典型规模 |
+|---|---|---|---|
+| 心跳 | ~500B × W / 5s | 2 MB/s @ 10k Worker | < 1% 25G 网卡 |
+| 任务派发 RPC | 1–2 KB × QPS | 20 MB/s @ 10k QPS | < 5% 25G 网卡 |
+| LLM 70B 流式输出 | n/a | n/a | **50–200 MB / 响应 × 100 并发 = 5–20 GB/s**,百级并发需多 100G RDMA |
+| LLM 70B 长上下文(8k→8k) | n/a | n/a | **~200 GB/s**,基本只能同 NVLink 域内做 |
+
+**关键结论**:
+- **中小模型(<10B)** 网络从来不是瓶颈,卡数受显存/算力约束
+- **LLM 70B+ 流式推理**:**网络才是真瓶颈**。千级并发需要:同节点回 GPU / NVLink 域内优先 / 跨机 RDMA + 压缩 / 跨可用区禁止实时流式
+
+### 12.7.2 ⚠️ 状态分层(热/冷)[V2.5 关键修复]
+
+**问题诊断**:心跳在规模化时不是带宽问题,是**状态一致性问题**。Worker 数从 1k → 30k,MySQL 心跳写入从 200/s 涨到 6k/s,InnoDB 行锁竞争加剧,主从复制延迟从 10ms 涨到 1s+,叠加任何 Leader+Follower 复制,故障恢复窗口被放大到分钟级。
+
+| 集群规模 | 心跳写频率 | MySQL TPS | 半同步复制延迟 | 故障恢复冷启动 |
+|---|---|---|---|---|
+| 300 Worker | 60/s | 0.06k | <5ms | <1s |
+| 1k Worker | 200/s | 0.2k | <10ms | <3s |
+| **3k Worker** | **600/s** | 0.6k | **<20ms** | **<10s** |
+| **10k Worker** | **2k/s** | **2k** | **50–200ms**(行锁 + buffer pool 抖动)| **30s–2min** |
+| **30k Worker** | 6k/s | 6k | 1s+ | 分钟级 |
+| 100k Worker | 20k/s | 20k | 复制延迟雪崩 | 分钟–小时级 |
+
+**§13 Q4「复用 ControllerManager」的语义歧义**:当前文档写"零运维成本、已成熟",但没明确:
+- 如果按 K8s ControllerManager 的 **reconcile 模式**理解 → Scheduler 应该无状态,所有状态从 MySQL 读,心跳只写 MySQL → 不需要 Leader+Follower 同步 → 与"低延迟调度(<50ms)"冲突(每次 `selectWorker()` 都查 MySQL 太慢)
+- 如果想要"低延迟 + 高可用" → 必须有 Leader 持有 in-memory 状态 + Follower 复制 → **真正的瓶颈就在这**
+
+**方案 A:Scheduler 无状态 + Redis 热状态 + MySQL 冷状态** ⭐推荐
+
+```
+┌─── Client ──── Gateway(无状态 L7) ──────────────────┐
+│                                                    ↓
+│         ┌─── Scheduler Pool(2~N 个无状态副本) ───┐
+│         │  - selectWorker() 读 Redis 热状态      │
+│         │  - 注册 / 摘除 写 MySQL 冷状态         │
+│         │  - 副本之间无任何同步                   │
+│         └─────┬─────────────────────┬────────────┘
+│               ↓                     ↓
+│  ┌── Redis Cluster(热状态) ──┐  ┌── MySQL(冷状态) ──┐
+│         │  - last_heartbeat_at       │  │  - worker 注册表   │
+│         │  - gpu_used_mb             │  │  - supported_ops   │
+│         │  - running_task_ids        │  │  - 任务历史        │
+│         │  - TTL 60s,Worker 死亡自动过期│  │  - 极少写入      │
+│         │  - 按 worker_id % N 分片   │  │  - 主从复制        │
+│         └─────────────────────────────┘  └────────────────────┘
+│
+└─── Worker → 心跳到 Redis(2k/s 写入对 Redis 轻负载)+ 注册 / 摘除到 MySQL
+```
+
+**对原设计的改动**:
+
+| 维度 | 现状(V2.1) | V2.5 改为 |
+|---|---|---|
+| Scheduler 部署 | 单点 + ControllerManager 选主 | 2~N 副本无状态,Gateway 一致性哈希 / 任意副本路由 |
+| 心跳存储 | 直写 MySQL | Redis Cluster(TTL 60s)+ 异步 worker 批量落库(30s 一次聚合) |
+| `gpu_worker_status` 表 | 高频写 | 删掉热字段,只留注册信息;热数据进 Redis |
+| Scheduler 重启冷启动 | 分钟级(从 MySQL 重载) | 无状态,任何副本 5s 内可服务,Worker 心跳 60s 内自动重新填充 Redis |
+| MySQL 半同步复制延迟 | 影响心跳可见性 | 不影响(热状态查询走 Redis) |
+
+**容量天花板**:**30k Worker / 100k GPU**(Redis Cluster 64 分片单集群 100GB+ 内存,轻松 hold)
+**运维复杂度**:中(Redis Cluster 比 etcd/Raft 简单一个数量级)
+
+**与方案 B/C 的对比**:
+
+| 方案 | 适用场景 | 天花板 | 运维复杂度 |
+|---|---|---|---|
+| **A**(推荐):无状态 + Redis 热 + MySQL 冷 | MVP 演进到 30k Worker | 30k Worker / 100k GPU | 中 |
+| B:Leader + Follower 只复制决策状态 | 审计要求决策可追溯 | 10k Worker / 30k GPU | 高 |
+| C:控制面 + 数据面物理隔离(按 Op 分片)| LLM 多区域多租户 | 30k+ Worker / 100k+ GPU | 高 |
+
+### 12.7.3 心跳与 HA 语义
+
+**心跳 3 类语义与对应存储路径**:
+
+| 心跳类型 | 频率 | 走哪条路 | 内容 |
+|---|---|---|---|
+| **状态变更心跳** | 2s | Redis Cluster(热) | `last_heartbeat_at`、`gpu_used_mb`、`running_task_ids` |
+| **健康上报** | 30s | Redis Cluster(热) | GPU 健康度、磁盘 / 显存余量 |
+| **任务进度上报** | 任务执行中实时 | Redis Pub/Sub + MySQL 冷表 | `task_id → progress_pct`(用于监控,不参与调度) |
+
+**Worker 心跳失败 → 自动剔除路径**:
+
+1. Worker 心跳 3 次未到(6s)→ Redis key TTL 过期(默认 60s 内任意副本会清理)
+2. Scheduler 任何副本下次 `selectWorker()` 查到 `HEALTHY` 过滤后自动跳过该 worker
+3. 任务派发到该 worker 的 RPC 超时 → Gateway 收到 `TaskDispatchFailure`,触发重派到其他 worker
+4. 90s 内 Worker 仍未恢复 → Scheduler 上报 `worker_deregistered` 事件 → MySQL 冷表标记 `last_seen_at`,运维介入
+
+**Scheduler 副本 HA**:
+- 2~N 个无状态副本,任意副本可服务任意请求
+- 健康检查:K8s liveness probe(HTTP `/healthz`,返回 in-memory 状态视图版本号)
+- Leader 不需要,Raft 不需要,etcd 不需要
+- 副本扩缩:基于 CPU 利用率 HPA,1 分钟内扩出来
+
+### 12.7.4 ⚠️ Federation 三种 Flavor[V3.0+]
+
+> V2.5 暂不实施,本节为协议预留 + 后续实现指引。
+
+**Flavor A:主从模式(Global Master + Regional Slave)** ⭐V3.0 推荐
+
+```
+┌────────────── Global Master(集中协调器)──────────────────┐
+│  - 集群注册中心: 每 Slave 上报 {region, GPU 数, 已加载模型, 利用率}│
+│  - 任务路由: 收到任务 → 按规则选 Slave → 转发到该 Slave Gateway│
+│  - 容灾编排: Master 故障时由 Slave 自治(降级模式)               │
+│  - 全局监控 + 配额 │
+└────────┬──────────┬──────────┬──────────┬─────────────────────┘
+         │          │          │          │
+   ┌─────▼────┐ ┌──▼─────┐ ┌──▼─────┐ ┌──▼─────┐
+   │ Slave A  │ │ Slave B │ │ Slave C │ │ Slave D │
+   │ Scheduler │ │Scheduler│ │Scheduler│ │Scheduler│
+   │ 8×H100   │ │16×A100  │ │4×4090   │ │32×H100  │
+   │ 已加载模型 │ │已加载模型│ │已加载模型│ │已加载模型│
+   └──────────┘ └────────┘ └────────┘ └────────┘
+```
+
+**协调器核心职责 4 类**:
+
+| 职责 | 内容 | MVP-V2.5 是否需要 |
+|---|---|---|
+| **集群身份注册** | 每 Slave 启动时向 Master 上报 mTLS 证书 + 区域 + GPU 清单 | ❌ |
+| **全局资源摘要** | 每 30s 同步一次 `{region, total_gpus, free_gpus, hot_models[], avg_load}` | ❌ |
+| **任务路由策略** | 客户端提交任务时,按"延迟 / 成本 / 容量 / 模型亲和"选目标 Slave | ❌ |
+| **故障切换 / 容灾** | Slave 心跳丢失 → Master 标记为 down → 路由表剔除 + 任务重派 | ❌ |
+
+**关键设计原则:协调器只同步元数据,不复制任务状态或心跳**
+- ❌ 反例:协调器复制每个 Worker 的 `last_heartbeat` → 协调器变超大 Scheduler,5k Worker 就崩
+- ✅ 正例:协调器只关心"Slave 集群还活着吗 + Slave 整体利用率多少" → 1 个 key / Slave / 30s,**与集群规模解耦**
+
+**Flavor B:对等模式(Peer-to-Peer Federation)** [V3.5+]
+- 所有集群地位平等,每集群都可接收任务
+- 通过 GSLB / 中心路由层按"延迟 / 成本 / 容量"分配
+- 集群间通过 Kafka/Pulsar 异步同步"集群级摘要"(不是全量状态)
+- 类比:Service Mesh 跨集群模式 / Karmada / Volcano Federation
+- 天花板:10 万级 GPU / 跨大洲多 region
+- 运维:复杂(终一致性、冲突解决、容量调度策略)
+
+**Flavor C:模型分发模式(CDN 风格)**[V3.5+]
+- 模型权重按"主 + 备"部署在少数集群,其他集群是"纯推理算力"
+- 任务来了找最近的 + 有模型的 + 有 GPU 的
+- 冷启动模型传输(用 NVMe + RDMA 异步复制)
+- 类比:CDN origin-pull / S3 cross-region replication
+- 运维:复杂(模型分发一致性、缓存失效、传输带宽)
+
+### 12.7.5 跨地域网络成本与模型亲和
+
+| 跨域类型 | RTT 典型 | 带宽费 | 适用 |
+|---|---|---|---|
+| 同可用区(同城) | 0.5–2 ms | 几乎免费 | 所有任务 |
+| 跨可用区(同城异地) | 5–20 ms | 中等 | 中小模型推理 / 训练 checkpoint 同步 |
+| 跨地域(异城) | 20–50 ms | 高 | 容灾 + 异地多活 |
+| 跨大洲 | 50–200 ms | 5–10× 高 | 跨国客户接入 |
+
+**任务路由原则**:
+- ✅ 同可用区优先 → 跨可用区回退 → 跨地域仅限异步任务(不允许 LLM 流式跨地域)
+- ✅ 模型亲和:任务 → 找已加载该模型的最近 Slave
+- ❌ LLM 长上下文(8k→8k)禁止跨地域实时传输
+- ❌ 模型权重跨域同步禁止在业务高峰期进行
+
+**模型分发经济性**:
+- LLM 70B 模型权重 ~140 GB(FP16),跨地域同步一次耗时 30+ 分钟,带宽费 ~$50/次
+- 建议:热门模型预加载到多个 Slave,冷门模型只存 1 个 Slave,跨域按需 lazy pull
+
+### 12.7.6 ⚠️ 演进路线表
+
+| 阶段 | 集群形态 | 协调器 | 心跳存储 | 触发条件 |
+|---|---|---|---|---|
+| **V2.1 MVP** | 单集群(1 个可用区) | 无 | MySQL 直写 | 客户全在国内同城 |
+| **V2.5** | 多可用区单集群 + Redis 热状态 | 无(靠交换机 / DNS 同城) | Redis Cluster + MySQL 冷 | 同城多机房,延迟 < 2 ms |
+| **V3.0** | **主从多 region(Flavor A)** | 轻量 Master | Redis Cluster 热 | 跨地域客户 + 容灾需求 |
+| **V3.5+** | 对等联邦(Flavor B)+ 模型分发(Flavor C)| 完整 Federation 调度器 | 同 V3.0 | LLM 多区域 / 跨国客户 |
+
+**V3.0 Master 实现要点**:
+- Master 是个轻量 Spring Boot 应用,只 4 张表:`cluster_registry` / `route_policy` / `region_quotas` / `failure_log`
+- 不持久化任务状态,任务仍由各 Slave 自己管
+- 主动健康检查(Master 每 10s ping Slave Gateway,不是 Slave 反向汇报)— 减少 Slave → Master 写入流量
+- 任务路由用一致性哈希 + 权重(地域权重 × 容量权重 × 延迟权重)
+- Master HA 走 etcd/Consul 选主,但状态都是可重建的,故障切换 5s 内恢复
+
+**Flavor C 在 V3.5 才做**,因为它涉及模型权重传输(几十 GB × 几卡),需要解决:
+- 模型仓库(PVC/S3/OSS)的跨区域复制
+- 冷启动延迟预算(模型拉到边缘集群,启动 vLLM,总耗时 < 5min)
+- 模型版本管理(SLA 期间不能换版本,只能故障恢复时切)
+
+---
+
 ## 13. ✅ 关键决策(已确认)
 
 > V2.1 基线冻结,SRE、算法负责人、业务方三方评审通过。
@@ -1562,11 +1775,14 @@ handler:
 | Q1 | GPU 共享模式 | **中期 MIG,长期按业务分级**(高隔离业务 MIG,中隔离业务 MPS,低隔离业务单进程独占) |
 | Q2 | Python Op 集成方式 | **默认 Sidecar,性能瓶颈 Op 改 PyO3** |
 | Q3 | 大张量传输默认走 | **同节点共享内存 → 跨节点 NAS(若已部署) → 否则 RDMA → 跨可用区对象存储** |
-| Q4 | 调度器选主 | **复用 ControllerManager**(零运维成本,已成熟) |
+| Q4 | 调度器选主 | **MVP 单副本 + ControllerManager 风格 reconcile;V2.5 演进为 Scheduler 2~N 副本无状态**(参见 §12.7.2 方案 A),不引入 Leader+Follower 状态复制;心跳热状态走 Redis Cluster,冷状态走 MySQL |
 | Q5 | 优先级抢占 | **默认关闭,关键业务按需开启** |
 | Q6 | 同节点亲和 | **默认 Soft Hint,无可用时回退跨节点** |
 | Q7 | 任务最长执行超时 | **推理 180s,训练 24h,可在请求中覆盖** |
 | Q8 | Worker ↔ GPU ↔ Op 关系(新增) | **默认 1:1(物理卡 ↔ Worker 进程),Op 在 Worker 启动期静态注册,Scheduler 只看 worker_id 不看 gpu_id**;1:N 仅在 LLM 跨卡 TP 场景启用,通过 WorkerConfig.managed_devices 声明 |
+| Q9 | 单集群 GPU 规模天花板(新增) | **≤ 30k Worker / 100k GPU**(方案 A:Redis 热 + MySQL 冷 + Scheduler 无状态);超过则按 op_id 分片 + 心跳走 Redis(参见 §12.7) |
+| Q10 | 多集群协调器形态(新增) | V3.0 起 Flavor A 主从模式;V3.5+ 演进到 Flavor B/C(对等 + 模型分发)(参见 §12.7.4) |
+| Q11 | 心跳存储(新增) | **Redis Cluster 热状态**(TTL 60s)+ MySQL 冷状态(注册 / 任务历史);调度器副本无状态,网关按一致性哈希路由(参见 §12.7.2 / §12.7.3) |
 
 **冻结时间**:V2.1 基线已冻结,进入 MVP 开发阶段。
 
